@@ -25,6 +25,60 @@ jobs:
       - name: Install XcodeGen
         run: brew install xcodegen
 
+      - name: Generate App Icon
+        run: |
+          # Generate a nice gradients app icon programmatically
+          mkdir -p App/Images.xcassets/AppIcon.appiconset
+          cat > App/Images.xcassets/AppIcon.appiconset/Contents.json << 'EOF'
+          {
+            "images" : [
+              { "size" : "20x20", "idiom" : "iphone", "filename" : "icon-40.png", "scale" : "2x" },
+              { "size" : "20x20", "idiom" : "iphone", "filename" : "icon-60.png", "scale" : "3x" },
+              { "size" : "29x29", "idiom" : "iphone", "filename" : "icon-58.png", "scale" : "2x" },
+              { "size" : "29x29", "idiom" : "iphone", "filename" : "icon-87.png", "scale" : "3x" },
+              { "size" : "40x40", "idiom" : "iphone", "filename" : "icon-80.png", "scale" : "2x" },
+              { "size" : "40x40", "idiom" : "iphone", "filename" : "icon-120.png", "scale" : "3x" },
+              { "size" : "60x60", "idiom" : "iphone", "filename" : "icon-120.png", "scale" : "2x" },
+              { "size" : "60x60", "idiom" : "iphone", "filename" : "icon-180.png", "scale" : "3x" },
+              { "size" : "1024x1024", "idiom" : "ios-marketing", "filename" : "icon-1024.png", "scale" : "1x" }
+            ],
+            "info" : { "version" : 1, "author" : "xcode" }
+          }
+          EOF
+          
+          # Swift script to generate the icon
+          cat > generate_icon.swift << 'EOF'
+          import Foundation
+          import CoreGraphics
+          import ImageIO
+          
+          func createIcon(size: CGFloat) -> CGImage? {
+              let width = Int(size)
+              let height = Int(size)
+              let colorSpace = CGColorSpaceCreateDeviceRGB()
+              guard let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: width * 4, space: colorSpace, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+              
+              // Gradient Background
+              let colors = [CGColor(red: 0.1, green: 0.1, blue: 0.1, alpha: 1.0), CGColor(red: 0.2, green: 0.0, blue: 0.4, alpha: 1.0)] as CFArray
+              if let gradient = CGGradient(colorsSpace: colorSpace, colors: colors, locations: [0.0, 1.0]) {
+                  context.drawLinearGradient(gradient, start: CGPoint(x: 0, y: 0), end: CGPoint(x: size, y: size), options: [])
+              }
+              
+              return context.makeImage()
+          }
+          
+          let sizes: [CGFloat] = [40, 58, 60, 80, 87, 120, 180, 1024]
+          for s in sizes {
+              if let img = createIcon(size: s) {
+                  let url = URL(fileURLWithPath: "App/Images.xcassets/AppIcon.appiconset/icon-\(Int(s)).png")
+                  guard let dest = CGImageDestinationCreateWithURL(url as CFURL, "public.png" as CFString, 1, nil) else { continue }
+                  CGImageDestinationAddImage(dest, img, nil)
+                  CGImageDestinationFinalize(dest)
+              }
+          }
+          EOF
+          swift generate_icon.swift
+
       - name: Generate Source Files
         run: |
           set -e
@@ -47,11 +101,12 @@ jobs:
               type: application
               platform: iOS
               deploymentTarget: "15.0"
-              sources: [Sources]
+              sources: [Sources, Images.xcassets]
               settings:
                 base:
                   INFOPLIST_FILE: Info.plist
                   PRODUCT_BUNDLE_IDENTIFIER: com.stas.VKMusicNative
+                  ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
               info:
                 path: Info.plist
                 properties:
@@ -217,16 +272,22 @@ jobs:
                   return response.data ?? []
               }
 
-              func deleteTrack(id: Int, ownerId: Int) async {
+              func deleteTrack(id: Int, ownerId: Int) async -> Bool {
                   let urlString = "\(baseURL)?action=delete&id=\(id)&owner_id=\(ownerId)"
-                  guard let url = URL(string: urlString) else { return }
-                  _ = try? await URLSession.shared.data(from: url)
+                  guard let url = URL(string: urlString) else { return false }
+                  do {
+                      let (_, response) = try await URLSession.shared.data(from: url)
+                      return (response as? HTTPURLResponse)?.statusCode == 200
+                  } catch { return false }
               }
 
-              func addTrack(id: Int, ownerId: Int) async {
+              func addTrack(id: Int, ownerId: Int) async -> Bool {
                   let urlString = "\(baseURL)?action=add&id=\(id)&owner_id=\(ownerId)"
-                  guard let url = URL(string: urlString) else { return }
-                  _ = try? await URLSession.shared.data(from: url)
+                  guard let url = URL(string: urlString) else { return false }
+                  do {
+                      let (_, response) = try await URLSession.shared.data(from: url)
+                      return (response as? HTTPURLResponse)?.statusCode == 200
+                  } catch { return false }
               }
 
               func addToPlaylist(audioId: Int, audioOwnerId: Int, playlistId: Int, playlistOwnerId: Int) async {
@@ -246,6 +307,8 @@ jobs:
 
           final class CacheManager: ObservableObject {
               @Published var cachedIDs: Set<String> = []
+              @Published var myMusicIDs: Set<String> = []
+              
               @Published var isDownloading: Bool = false
               @Published var progressDone: Int = 0
               @Published var progressTotal: Int = 0
@@ -261,10 +324,17 @@ jobs:
                   if let saved = UserDefaults.standard.array(forKey: "cachedIDs") as? [String] {
                       cachedIDs = Set(saved)
                   }
+                  if let savedMyMusic = UserDefaults.standard.array(forKey: "myMusicIDs") as? [String] {
+                      myMusicIDs = Set(savedMyMusic)
+                  }
               }
 
               private func persistCachedIDs() {
                   UserDefaults.standard.set(Array(cachedIDs), forKey: "cachedIDs")
+              }
+              
+              private func persistMyMusicIDs() {
+                  UserDefaults.standard.set(Array(myMusicIDs), forKey: "myMusicIDs")
               }
 
               func isDownloaded(_ track: Track) -> Bool {
@@ -301,6 +371,20 @@ jobs:
                   if let encoded = try? JSONEncoder().encode(tracks) {
                       UserDefaults.standard.set(encoded, forKey: "myMusicOrder")
                   }
+                  
+                  // Update the set of liked IDs
+                  myMusicIDs = Set(tracks.map { $0.uniqueKey })
+                  persistMyMusicIDs()
+              }
+              
+              func addToMyMusic(track: Track) {
+                  myMusicIDs.insert(track.uniqueKey)
+                  persistMyMusicIDs()
+              }
+              
+              func removeFromMyMusic(track: Track) {
+                  myMusicIDs.remove(track.uniqueKey)
+                  persistMyMusicIDs()
               }
 
               func getMyMusicOrder() -> [Track] {
@@ -442,6 +526,7 @@ jobs:
               @Published var playMode: PlayMode = .normal
               @Published var recentlyPlayed: [Track] = []
               @Published var searchHistory: [String] = []
+              @Published var isVKMixPlaying: Bool = false
 
               enum PlayMode: Int {
                   case normal = 0
@@ -465,7 +550,14 @@ jobs:
 
               // MARK: - Public Playback API
 
-              func play(track: Track, in tracks: [Track]) {
+              func play(track: Track, in tracks: [Track], isVKMix: Bool = false) {
+                  // If user taps on the currently playing track, just toggle play/pause!
+                  if track == currentTrack && queue == tracks {
+                      togglePlay()
+                      return
+                  }
+                  
+                  isVKMixPlaying = isVKMix
                   removeObservers()
                   originalQueue = tracks
 
@@ -516,10 +608,8 @@ jobs:
 
               func prevTrack() {
                   guard !queue.isEmpty else { return }
-                  if currentTime > 3 {
-                      avPlayer?.seek(to: .zero)
-                      return
-                  }
+                  // Removed 3-second seek behavior per user request
+                  // Now it ALWAYS goes to the previous track
                   removeObservers()
                   currentIndex = currentIndex > 0 ? currentIndex - 1 : queue.count - 1
                   beginPlayback()
@@ -785,7 +875,7 @@ jobs:
                               case 0:
                                   MyMusicView()
                               case 1:
-                                  OnlineMusicView()
+                                  VKMixView() // Replaced Online with VK Mix
                               case 2:
                                   SearchView()
                               case 3:
@@ -829,7 +919,7 @@ jobs:
                   ScrollView(.horizontal, showsIndicators: false) {
                       HStack(spacing: 4) {
                           tabButton(title: "Моя музыка", icon: "music.note.list", tag: 0)
-                          tabButton(title: "Онлайн", icon: "antenna.radiowaves.left.and.right", tag: 1)
+                          tabButton(title: "VK Микс", icon: "waveform.circle", tag: 1, highlight: player.isVKMixPlaying)
                           tabButton(title: "Поиск", icon: "magnifyingglass", tag: 2)
                           tabButton(title: "Плейлисты", icon: "list.bullet.rectangle.portrait", tag: 3)
                       }
@@ -839,13 +929,14 @@ jobs:
                   .background(Color(red: 0.08, green: 0.08, blue: 0.09))
               }
 
-              private func tabButton(title: String, icon: String, tag: Int) -> some View {
+              private func tabButton(title: String, icon: String, tag: Int, highlight: Bool = false) -> some View {
                   Button {
                       withAnimation(.easeInOut(duration: 0.2)) { selectedTab = tag }
                   } label: {
                       HStack(spacing: 6) {
                           Image(systemName: icon)
                               .font(.system(size: 14, weight: .semibold))
+                              .foregroundColor(highlight && selectedTab != tag ? .blue : .primary)
                           Text(title)
                               .font(.system(size: 14, weight: .semibold))
                       }
@@ -854,6 +945,10 @@ jobs:
                       .padding(.vertical, 10)
                       .background(selectedTab == tag ? Color.white.opacity(0.15) : Color.clear)
                       .cornerRadius(20)
+                      .overlay(
+                          RoundedRectangle(cornerRadius: 20)
+                              .stroke(highlight ? Color.blue.opacity(0.5) : Color.clear, lineWidth: 1)
+                      )
                   }
               }
           }
@@ -898,7 +993,9 @@ jobs:
                   .overlay(toastOverlay, alignment: .top)
                   .task { await loadInitialTracks() }
                   .sheet(isPresented: $showPlaylistPicker) {
-                      playlistPickerSheet
+                      PlaylistPickerSheet(track: trackForPlaylist, playlists: $playlists, isPresented: $showPlaylistPicker, onComplete: { msg in
+                          showToast(msg)
+                      })
                   }
               }
 
@@ -1063,48 +1160,17 @@ jobs:
 
                   Button(role: .destructive) {
                       Task {
-                          await APIService.shared.deleteTrack(id: track.id, ownerId: track.owner_id)
-                          tracks.removeAll { $0 == track }
-                          showToast("Трек удален")
+                          let ok = await APIService.shared.deleteTrack(id: track.id, ownerId: track.owner_id)
+                          if ok {
+                              tracks.removeAll { $0 == track }
+                              cache.removeFromMyMusic(track: track)
+                              showToast("Трек удален")
+                          } else {
+                              showToast("Ошибка удаления")
+                          }
                       }
                   } label: {
                       Label("Удалить", systemImage: "trash")
-                  }
-              }
-
-              // MARK: - Playlist Picker
-
-              private var playlistPickerSheet: some View {
-                  NavigationView {
-                      List(playlists) { playlist in
-                          Button {
-                              guard let track = trackForPlaylist else { return }
-                              Task {
-                                  await APIService.shared.addToPlaylist(
-                                      audioId: track.id,
-                                      audioOwnerId: track.owner_id,
-                                      playlistId: playlist.id,
-                                      playlistOwnerId: playlist.owner_id
-                                  )
-                                  showPlaylistPicker = false
-                                  showToast("Добавлено в \(playlist.title)")
-                              }
-                          } label: {
-                              HStack(spacing: 12) {
-                                  CoverImageView(urlString: playlist.cover, size: 44)
-                                  Text(playlist.title).foregroundColor(.white)
-                              }
-                          }
-                          .listRowBackground(Color(UIColor.secondarySystemBackground))
-                      }
-                      .listStyle(.insetGrouped)
-                      .navigationTitle("В плейлист")
-                      .navigationBarTitleDisplayMode(.inline)
-                      .toolbar {
-                          ToolbarItem(placement: .cancellationAction) {
-                              Button("Отмена") { showPlaylistPicker = false }
-                          }
-                      }
                   }
               }
 
@@ -1180,82 +1246,96 @@ jobs:
           XEOF
 
           # ============================================================
-          # 8. ONLINE MUSIC VIEW
+          # 8. VK MIX VIEW (Replaces Online)
           # ============================================================
-          cat > App/Sources/OnlineMusicView.swift << 'XEOF'
+          cat > App/Sources/VKMixView.swift << 'XEOF'
           import SwiftUI
 
-          struct OnlineMusicView: View {
+          struct VKMixView: View {
               @EnvironmentObject var player: PlayerManager
-              @State private var tracks: [Track] = []
-              @State private var loadOffset: Int = 0
               @State private var isLoading: Bool = false
-              @State private var hasMore: Bool = true
-
+              
               var body: some View {
-                  ScrollView {
-                      LazyVStack(spacing: 0) {
-                          HStack {
-                              VStack(alignment: .leading, spacing: 4) {
-                                  Text("Онлайн")
-                                      .font(.system(size: 22, weight: .bold))
-                                  Text("Потоковое воспроизведение")
-                                      .font(.system(size: 13))
-                                      .foregroundColor(.gray)
-                              }
-                              Spacer()
-                              Image(systemName: "antenna.radiowaves.left.and.right")
-                                  .font(.system(size: 24))
-                                  .foregroundColor(.blue)
-                          }
-                          .padding(.horizontal, 16)
-                          .padding(.vertical, 12)
-
-                          ForEach(Array(tracks.enumerated()), id: \.offset) { index, track in
-                              TrackRow(
-                                  track: track,
-                                  isPlaying: player.currentTrack == track && player.isPlaying,
-                                  isCached: false
+                  VStack(spacing: 30) {
+                      Spacer()
+                      
+                      ZStack {
+                          Circle()
+                              .fill(
+                                  LinearGradient(
+                                      gradient: Gradient(colors: [.blue, .purple]),
+                                      startPoint: .topLeading,
+                                      endPoint: .bottomTrailing
+                                  )
                               )
-                              .contentShape(Rectangle())
-                              .onTapGesture {
-                                  player.play(track: track, in: tracks)
-                              }
-                              .onAppear {
-                                  if index >= tracks.count - 5 {
-                                      Task { await loadMore() }
-                                  }
-                              }
-
-                              Divider().background(Color.gray.opacity(0.2))
+                              .frame(width: 200, height: 200)
+                              .shadow(color: .purple.opacity(0.5), radius: 30, x: 0, y: 10)
+                              
+                          if player.isVKMixPlaying && player.isPlaying {
+                              // Cool animation if playing VK Mix
+                              Circle()
+                                  .stroke(Color.white.opacity(0.4), lineWidth: 4)
+                                  .frame(width: 230, height: 230)
+                                  .scaleEffect(1.1)
+                                  .animation(.easeInOut(duration: 1).repeatForever(autoreverses: true), value: player.isPlaying)
                           }
-
-                          if isLoading {
-                              ProgressView().padding(20)
-                          }
+                          
+                          Image(systemName: "waveform")
+                              .font(.system(size: 80))
+                              .foregroundColor(.white)
                       }
-                      .padding(.horizontal, 16)
+                      
+                      VStack(spacing: 10) {
+                          Text("VK Микс")
+                              .font(.system(size: 32, weight: .bold))
+                          
+                          Text("Бесконечный поток треков,\nподобранный специально для вас")
+                              .font(.system(size: 16))
+                              .foregroundColor(.gray)
+                              .multilineTextAlignment(.center)
+                              .padding(.horizontal, 40)
+                      }
+                      
+                      Button(action: {
+                          if player.isVKMixPlaying {
+                              player.togglePlay()
+                          } else {
+                              startVKMix()
+                          }
+                      }) {
+                          HStack {
+                              if isLoading {
+                                  ProgressView()
+                                      .progressViewStyle(CircularProgressViewStyle(tint: .white))
+                                      .padding(.trailing, 5)
+                              } else {
+                                  Image(systemName: (player.isVKMixPlaying && player.isPlaying) ? "pause.fill" : "play.fill")
+                                      .font(.system(size: 20))
+                              }
+                              Text((player.isVKMixPlaying && player.isPlaying) ? "Пауза" : "Слушать Микс")
+                                  .font(.system(size: 18, weight: .bold))
+                          }
+                          .frame(width: 240, height: 60)
+                          .background(Color.white)
+                          .foregroundColor(.black)
+                          .cornerRadius(30)
+                          .shadow(color: .white.opacity(0.3), radius: 10, y: 5)
+                      }
+                      .disabled(isLoading)
+                      
+                      Spacer()
                   }
-                  .task { await loadInitial() }
               }
 
-              private func loadInitial() async {
-                  guard tracks.isEmpty else { return }
+              private func startVKMix() {
                   isLoading = true
-                  tracks = (try? await APIService.shared.fetchMyMusic(offset: 0, count: 200)) ?? []
-                  loadOffset = tracks.count
-                  hasMore = tracks.count >= 200
-                  isLoading = false
-              }
-
-              private func loadMore() async {
-                  guard !isLoading, hasMore else { return }
-                  isLoading = true
-                  let batch = (try? await APIService.shared.fetchMyMusic(offset: loadOffset, count: 200)) ?? []
-                  tracks.append(contentsOf: batch)
-                  loadOffset += batch.count
-                  hasMore = batch.count >= 200
-                  isLoading = false
+                  Task {
+                      let mixTracks = (try? await APIService.shared.fetchVKMix()) ?? []
+                      isLoading = false
+                      if !mixTracks.isEmpty {
+                          player.play(track: mixTracks[0], in: mixTracks, isVKMix: true)
+                      }
+                  }
               }
           }
           XEOF
@@ -1272,7 +1352,6 @@ jobs:
               @EnvironmentObject var cache: CacheManager
               @State private var searchText: String = ""
               @State private var searchResults: [Track] = []
-              @State private var vkMixTracks: [Track] = []
               @State private var isSearching: Bool = false
               @State private var currentMode: SearchMode = .idle
 
@@ -1280,7 +1359,6 @@ jobs:
                   case idle
                   case results
                   case recentlyPlayed
-                  case vkMix
               }
 
               var body: some View {
@@ -1320,8 +1398,6 @@ jobs:
                               searchResultsContent
                           case .recentlyPlayed:
                               recentlyPlayedContent
-                          case .vkMix:
-                              vkMixContent
                           }
                       }
                   }
@@ -1380,33 +1456,6 @@ jobs:
                                           .font(.system(size: 16, weight: .semibold))
                                           .foregroundColor(.white)
                                       Text("\(player.recentlyPlayed.count) треков")
-                                          .font(.system(size: 13))
-                                          .foregroundColor(.gray)
-                                  }
-                                  Spacer()
-                                  Image(systemName: "chevron.right").foregroundColor(.gray)
-                              }
-                              .padding(14)
-                              .background(Color(UIColor.secondarySystemBackground))
-                              .cornerRadius(14)
-                          }
-
-                          // VK Mix
-                          Button { startVKMix() } label: {
-                              HStack(spacing: 14) {
-                                  ZStack {
-                                      RoundedRectangle(cornerRadius: 12)
-                                          .fill(Color.blue.opacity(0.2))
-                                          .frame(width: 50, height: 50)
-                                      Image(systemName: "waveform.circle.fill")
-                                          .font(.system(size: 22))
-                                          .foregroundColor(.blue)
-                                  }
-                                  VStack(alignment: .leading, spacing: 3) {
-                                      Text("VK Микс")
-                                          .font(.system(size: 16, weight: .semibold))
-                                          .foregroundColor(.white)
-                                      Text("Обновляется каждый раз")
                                           .font(.system(size: 13))
                                           .foregroundColor(.gray)
                                   }
@@ -1488,51 +1537,6 @@ jobs:
                   }
               }
 
-              // MARK: - VK Mix
-
-              private var vkMixContent: some View {
-                  VStack(alignment: .leading, spacing: 0) {
-                      HStack {
-                          Button { currentMode = .idle } label: {
-                              HStack(spacing: 4) {
-                                  Image(systemName: "chevron.left")
-                                  Text("Назад")
-                              }
-                              .foregroundColor(.blue)
-                          }
-                          Spacer()
-                          Text("VK Микс").font(.system(size: 16, weight: .bold))
-                          Spacer()
-                          Button { startVKMix() } label: {
-                              Image(systemName: "arrow.triangle.2.circlepath").foregroundColor(.blue)
-                          }
-                          .frame(width: 60)
-                      }
-                      .padding(.horizontal, 16)
-                      .padding(.vertical, 10)
-
-                      if vkMixTracks.isEmpty {
-                          ProgressView().frame(maxWidth: .infinity).padding(30)
-                      } else {
-                          LazyVStack(spacing: 0) {
-                              ForEach(Array(vkMixTracks.enumerated()), id: \.offset) { _, track in
-                                  TrackRow(
-                                      track: track,
-                                      isPlaying: player.currentTrack == track && player.isPlaying,
-                                      isCached: cache.isDownloaded(track)
-                                  )
-                                  .contentShape(Rectangle())
-                                  .onTapGesture {
-                                      player.play(track: track, in: vkMixTracks)
-                                  }
-                                  Divider().background(Color.gray.opacity(0.2))
-                              }
-                          }
-                          .padding(.horizontal, 16)
-                      }
-                  }
-              }
-
               // MARK: - Helpers
 
               private func headerBar(title: String) -> some View {
@@ -1573,14 +1577,6 @@ jobs:
                   Task {
                       searchResults = (try? await APIService.shared.searchTracks(query: q)) ?? []
                       isSearching = false
-                  }
-              }
-
-              private func startVKMix() {
-                  currentMode = .vkMix
-                  vkMixTracks = []
-                  Task {
-                      vkMixTracks = (try? await APIService.shared.fetchVKMix()) ?? []
                   }
               }
           }
@@ -1809,6 +1805,8 @@ jobs:
               @State private var dragOffset: CGFloat = 0
               @State private var seekValue: Double = 0
               @State private var isSeeking: Bool = false
+              @State private var showPlaylistPicker: Bool = false
+              @State private var playlists: [Playlist] = []
 
               var body: some View {
                   ZStack {
@@ -1832,9 +1830,9 @@ jobs:
                                           .frame(width: 44, height: 44)
                                   }
                                   Spacer()
-                                  Text("СЕЙЧАС ИГРАЕТ")
+                                  Text(player.isVKMixPlaying ? "VK МИКС" : "СЕЙЧАС ИГРАЕТ")
                                       .font(.system(size: 12, weight: .bold))
-                                      .foregroundColor(.gray)
+                                      .foregroundColor(player.isVKMixPlaying ? .purple : .gray)
                                       .tracking(1.5)
                                   Spacer()
                                   Color.clear.frame(width: 44, height: 44)
@@ -1867,8 +1865,8 @@ jobs:
 
                               Spacer()
 
-                              // Track info
-                              HStack(alignment: .top) {
+                              // Track info + actions
+                              HStack(alignment: .center) {
                                   VStack(alignment: .leading, spacing: 6) {
                                       Text(track.title)
                                           .font(.system(size: 22, weight: .bold))
@@ -1879,10 +1877,27 @@ jobs:
                                           .lineLimit(1)
                                   }
                                   Spacer()
-                                  if cache.isDownloaded(track) {
-                                      Image(systemName: "checkmark.circle.fill")
-                                          .foregroundColor(.green)
-                                          .font(.system(size: 18))
+                                  
+                                  HStack(spacing: 20) {
+                                      // Plus (Add to playlist)
+                                      Button(action: {
+                                          Task {
+                                              playlists = (try? await APIService.shared.fetchPlaylists()) ?? []
+                                              showPlaylistPicker = true
+                                          }
+                                      }) {
+                                          Image(systemName: "plus.circle")
+                                              .font(.system(size: 24))
+                                              .foregroundColor(.gray)
+                                      }
+                                      
+                                      // Heart (Add/Remove from My Music)
+                                      let isAdded = cache.myMusicIDs.contains(track.uniqueKey)
+                                      Button(action: { toggleLike(for: track, isAdded: isAdded) }) {
+                                          Image(systemName: isAdded ? "heart.fill" : "heart")
+                                              .font(.system(size: 24))
+                                              .foregroundColor(isAdded ? .white : .gray)
+                                      }
                                   }
                               }
                               .padding(.horizontal, 30)
@@ -1986,6 +2001,9 @@ jobs:
                           }
                   )
                   .animation(.interactiveSpring(), value: dragOffset)
+                  .sheet(isPresented: $showPlaylistPicker) {
+                      PlaylistPickerSheet(track: player.currentTrack, playlists: $playlists, isPresented: $showPlaylistPicker, onComplete: { _ in })
+                  }
               }
 
               private var playModeIcon: String {
@@ -1993,6 +2011,18 @@ jobs:
                   case .normal: return "list.bullet"
                   case .shuffle: return "shuffle"
                   case .repeatOne: return "repeat.1"
+                  }
+              }
+              
+              private func toggleLike(for track: Track, isAdded: Bool) {
+                  Task {
+                      if isAdded {
+                          let success = await APIService.shared.deleteTrack(id: track.id, ownerId: track.owner_id)
+                          if success { cache.removeFromMyMusic(track: track) }
+                      } else {
+                          let success = await APIService.shared.addTrack(id: track.id, ownerId: track.owner_id)
+                          if success { cache.addToMyMusic(track: track) }
+                      }
                   }
               }
 
@@ -2050,6 +2080,49 @@ jobs:
                       }
                   }
                   .padding(.vertical, 6)
+              }
+          }
+          
+          // MARK: - Playlist Picker Sheet Shared
+
+          struct PlaylistPickerSheet: View {
+              let track: Track?
+              @Binding var playlists: [Playlist]
+              @Binding var isPresented: Bool
+              var onComplete: (String) -> Void
+              
+              var body: some View {
+                  NavigationView {
+                      List(playlists) { playlist in
+                          Button {
+                              guard let track = track else { return }
+                              Task {
+                                  await APIService.shared.addToPlaylist(
+                                      audioId: track.id,
+                                      audioOwnerId: track.owner_id,
+                                      playlistId: playlist.id,
+                                      playlistOwnerId: playlist.owner_id
+                                  )
+                                  isPresented = false
+                                  onComplete("Добавлено в \(playlist.title)")
+                              }
+                          } label: {
+                              HStack(spacing: 12) {
+                                  CoverImageView(urlString: playlist.cover, size: 44)
+                                  Text(playlist.title).foregroundColor(.white)
+                              }
+                          }
+                          .listRowBackground(Color(UIColor.secondarySystemBackground))
+                      }
+                      .listStyle(.insetGrouped)
+                      .navigationTitle("В плейлист")
+                      .navigationBarTitleDisplayMode(.inline)
+                      .toolbar {
+                          ToolbarItem(placement: .cancellationAction) {
+                              Button("Отмена") { isPresented = false }
+                          }
+                      }
+                  }
               }
           }
 
