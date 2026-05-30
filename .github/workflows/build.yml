@@ -1,0 +1,501 @@
+name: Build Full Native iOS App
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    
+    steps:
+      - name: Install XcodeGen
+        run: brew install xcodegen
+        
+      - name: Generate Swift Code
+        run: |
+          mkdir -p App/Sources
+          
+          # === ФАЙЛ НАСТРОЕК ПРОЕКТА ===
+          cat << 'EOF' > App/project.yml
+          name: VKMusicNative
+          options:
+            bundleIdPrefix: com.stas
+          targets:
+            VKMusicNative:
+              type: application
+              platform: iOS
+              deploymentTarget: "15.0"
+              sources: [Sources]
+              info:
+                properties:
+                  UILaunchStoryboardName: LaunchScreen
+                  UIBackgroundModes: [audio]
+                  NSAppTransportSecurity:
+                    NSAllowsArbitraryLoads: true
+          EOF
+          
+          # === ТОЧКА ВХОДА ===
+          cat << 'EOF' > App/Sources/App.swift
+          import SwiftUI
+          import AVFoundation
+          import MediaPlayer
+
+          @main
+          struct VKMusicNativeApp: App {
+              init() {
+                  do {
+                      try AVAudioSession.sharedInstance().setCategory(.playback, mode: .default)
+                      try AVAudioSession.sharedInstance().setActive(true)
+                  } catch {
+                      print("Audio session failed: \(error)")
+                  }
+              }
+              var body: some Scene {
+                  WindowGroup {
+                      MainView()
+                          .preferredColorScheme(.dark) // Принудительная темная тема
+                  }
+              }
+          }
+          EOF
+          
+          # === МОДЕЛИ И API ===
+          cat << 'EOF' > App/Sources/Models.swift
+          import Foundation
+
+          struct APIResponse: Codable {
+              let status: String
+              let data: [Track]?
+          }
+
+          struct Track: Codable, Identifiable, Equatable {
+              let id: Int
+              let title: String
+              let artist: String
+              let url: String
+              let cover: String
+              let owner_id: Int?
+          }
+          EOF
+          
+          # === МЕНЕДЖЕР ЗАГРУЗОК (ОФФЛАЙН) ===
+          cat << 'EOF' > App/Sources/DownloadManager.swift
+          import Foundation
+
+          class DownloadManager: ObservableObject {
+              static let shared = DownloadManager()
+              @Published var downloadedTrackIDs: Set<Int> = []
+              
+              private let fileManager = FileManager.default
+              private var documentsURL: URL {
+                  fileManager.urls(for: .documentDirectory, in: .userDomainMask)[0]
+              }
+              
+              init() {
+                  loadSavedState()
+              }
+              
+              private func loadSavedState() {
+                  if let saved = UserDefaults.standard.array(forKey: "downloadedTracks") as? [Int] {
+                      downloadedTrackIDs = Set(saved)
+                  }
+              }
+              
+              private func saveState() {
+                  UserDefaults.standard.set(Array(downloadedTrackIDs), forKey: "downloadedTracks")
+              }
+              
+              func isDownloaded(trackId: Int) -> Bool {
+                  return downloadedTrackIDs.contains(trackId)
+              }
+              
+              func getLocalURL(for trackId: Int) -> URL? {
+                  let fileURL = documentsURL.appendingPathComponent("\(trackId).mp3")
+                  return fileManager.fileExists(atPath: fileURL.path) ? fileURL : nil
+              }
+              
+              func download(track: Track, completion: @escaping (Bool) -> Void = {_ in }) {
+                  guard !isDownloaded(trackId: track.id), let url = URL(string: track.url) else { 
+                      completion(true)
+                      return 
+                  }
+                  
+                  let task = URLSession.shared.downloadTask(with: url) { localURL, _, error in
+                      guard let localURL = localURL, error == nil else {
+                          DispatchQueue.main.async { completion(false) }
+                          return
+                      }
+                      
+                      let destinationURL = self.documentsURL.appendingPathComponent("\(track.id).mp3")
+                      do {
+                          if self.fileManager.fileExists(atPath: destinationURL.path) {
+                              try self.fileManager.removeItem(at: destinationURL)
+                          }
+                          try self.fileManager.moveItem(at: localURL, to: destinationURL)
+                          DispatchQueue.main.async {
+                              self.downloadedTrackIDs.insert(track.id)
+                              self.saveState()
+                              completion(true)
+                          }
+                      } catch {
+                          DispatchQueue.main.async { completion(false) }
+                      }
+                  }
+                  task.resume()
+              }
+              
+              func downloadAll(tracks: [Track]) {
+                  for track in tracks {
+                      download(track: track)
+                  }
+              }
+          }
+          EOF
+          
+          # === АУДИОПЛЕЕР ===
+          cat << 'EOF' > App/Sources/PlayerManager.swift
+          import Foundation
+          import AVFoundation
+          import MediaPlayer
+
+          class PlayerManager: ObservableObject {
+              static let shared = PlayerManager()
+              
+              @Published var currentTrack: Track?
+              @Published var isPlaying = false
+              @Published var isLiked = true // Локальное состояние для сердечка
+              
+              var queue: [Track] = []
+              var currentIndex: Int = 0
+              var player: AVPlayer?
+              
+              func play(track: Track, in queue: [Track]) {
+                  self.queue = queue
+                  self.currentIndex = queue.firstIndex(where: { $0.id == track.id }) ?? 0
+                  self.currentTrack = track
+                  self.isLiked = true // По умолчанию считаем добавленным, если это "Моя музыка"
+                  
+                  // Проверяем, есть ли оффлайн версия
+                  let playURL: URL
+                  if let localURL = DownloadManager.shared.getLocalURL(for: track.id) {
+                      playURL = localURL
+                      print("Playing offline")
+                  } else {
+                      playURL = URL(string: track.url)!
+                      print("Playing online")
+                  }
+                  
+                  player = AVPlayer(url: playURL)
+                  player?.play()
+                  isPlaying = true
+                  
+                  setupNowPlaying(track: track)
+                  
+                  NotificationCenter.default.addObserver(self, selector: #selector(trackDidEnd), name: .AVPlayerItemDidPlayToEndTime, object: player?.currentItem)
+              }
+              
+              func togglePlay() {
+                  guard let player = player else { return }
+                  if isPlaying { player.pause() } else { player.play() }
+                  isPlaying.toggle()
+              }
+              
+              @objc func nextTrack() {
+                  guard !queue.isEmpty else { return }
+                  currentIndex = (currentIndex + 1) % queue.count
+                  play(track: queue[currentIndex], in: queue)
+              }
+              
+              @objc func prevTrack() {
+                  guard !queue.isEmpty else { return }
+                  currentIndex = currentIndex - 1 < 0 ? queue.count - 1 : currentIndex - 1
+                  play(track: queue[currentIndex], in: queue)
+              }
+              
+              @objc func trackDidEnd() {
+                  nextTrack()
+              }
+              
+              func toggleLike() {
+                  guard let track = currentTrack else { return }
+                  isLiked.toggle()
+                  
+                  let action = isLiked ? "add" : "delete"
+                  let ownerId = track.owner_id ?? 0
+                  let urlString = "https://kbgov.kz/12/api.php?action=\(action)&id=\(track.id)&owner_id=\(ownerId)"
+                  
+                  if let url = URL(string: urlString) {
+                      URLSession.shared.dataTask(with: url).resume() // Отправляем запрос в фоне
+                  }
+              }
+              
+              private func setupNowPlaying(track: Track) {
+                  var nowPlayingInfo = [String: Any]()
+                  nowPlayingInfo[MPMediaItemPropertyTitle] = track.title
+                  nowPlayingInfo[MPMediaItemPropertyArtist] = track.artist
+                  MPNowPlayingInfoCenter.default().nowPlayingInfo = nowPlayingInfo
+                  
+                  let commandCenter = MPRemoteCommandCenter.shared()
+                  commandCenter.playCommand.addTarget { _ in self.togglePlay(); return .success }
+                  commandCenter.pauseCommand.addTarget { _ in self.togglePlay(); return .success }
+                  commandCenter.nextTrackCommand.addTarget { _ in self.nextTrack(); return .success }
+                  commandCenter.previousTrackCommand.addTarget { _ in self.prevTrack(); return .success }
+              }
+          }
+          EOF
+          
+          # === ПОЛЬЗОВАТЕЛЬСКИЙ ИНТЕРФЕЙС ===
+          cat << 'EOF' > App/Sources/MainView.swift
+          import SwiftUI
+
+          struct MainView: View {
+              @StateObject var playerObj = PlayerManager.shared
+              @StateObject var dlManager = DownloadManager.shared
+              @State var tracks: [Track] = []
+              @State var isLoading = false
+              @State var showFullPlayer = false
+              
+              var body: some View {
+                  ZStack(alignment: .bottom) {
+                      NavigationView {
+                          VStack(spacing: 0) {
+                              // Кнопки управления кэшем
+                              HStack {
+                                  Button(action: syncTracks) {
+                                      Label("Синхронизация", systemImage: "arrow.triangle.2.circlepath")
+                                          .frame(maxWidth: .infinity)
+                                          .padding()
+                                          .background(Color(UIColor.secondarySystemBackground))
+                                          .cornerRadius(12)
+                                  }
+                                  
+                                  Button(action: { dlManager.downloadAll(tracks: tracks) }) {
+                                      Label("Скачать всё", systemImage: "arrow.down.circle.fill")
+                                          .frame(maxWidth: .infinity)
+                                          .padding()
+                                          .background(Color.blue.opacity(0.2))
+                                          .foregroundColor(.blue)
+                                          .cornerRadius(12)
+                                  }
+                              }
+                              .padding(.horizontal)
+                              .padding(.bottom, 10)
+                              
+                              // Список треков
+                              List(tracks) { track in
+                                  TrackRow(track: track, isPlaying: playerObj.currentTrack?.id == track.id)
+                                      .onTapGesture {
+                                          playerObj.play(track: track, in: tracks)
+                                      }
+                                      .listRowBackground(Color.clear)
+                                      .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
+                                      .listRowSeparator(.hidden)
+                              }
+                              .listStyle(PlainListStyle())
+                          }
+                          .navigationTitle("Моя Музыка")
+                          .onAppear(perform: loadMusic)
+                      }
+                      
+                      // Мини-плеер
+                      if let track = playerObj.currentTrack {
+                          MiniPlayerView(track: track)
+                              .onTapGesture { showFullPlayer = true }
+                      }
+                  }
+                  .sheet(isPresented: $showFullPlayer) {
+                      FullPlayerView()
+                  }
+              }
+              
+              func loadMusic() {
+                  guard tracks.isEmpty else { return }
+                  isLoading = true
+                  guard let url = URL(string: "https://kbgov.kz/12/api.php?action=my_music&offset=0&count=200") else { return }
+                  
+                  URLSession.shared.dataTask(with: url) { data, _, _ in
+                      if let data = data, let res = try? JSONDecoder().decode(APIResponse.self, from: data) {
+                          DispatchQueue.main.async {
+                              self.tracks = res.data ?? []
+                              self.isLoading = false
+                          }
+                      }
+                  }.resume()
+              }
+              
+              func syncTracks() {
+                  // Скачивает те треки из списка, которых нет в памяти
+                  dlManager.downloadAll(tracks: Array(tracks.prefix(50)))
+              }
+          }
+
+          struct TrackRow: View {
+              let track: Track
+              let isPlaying: Bool
+              @StateObject var dlManager = DownloadManager.shared
+              
+              var body: some View {
+                  HStack {
+                      AsyncImage(url: URL(string: track.cover)) { img in
+                          img.resizable().aspectRatio(contentMode: .fill)
+                      } placeholder: { Color.gray.opacity(0.3) }
+                      .frame(width: 50, height: 50)
+                      .cornerRadius(8)
+                      
+                      VStack(alignment: .leading, spacing: 4) {
+                          Text(track.title)
+                              .font(.system(size: 16, weight: .semibold))
+                              .foregroundColor(isPlaying ? .blue : .primary)
+                              .lineLimit(1)
+                          Text(track.artist)
+                              .font(.system(size: 14))
+                              .foregroundColor(.gray)
+                              .lineLimit(1)
+                      }
+                      Spacer()
+                      
+                      // Иконка загрузки (зеленая галочка если скачан)
+                      if dlManager.isDownloaded(trackId: track.id) {
+                          Image(systemName: "checkmark.circle.fill")
+                              .foregroundColor(.green)
+                              .font(.system(size: 14))
+                      }
+                  }
+                  .padding(.vertical, 4)
+                  .background(Color(UIColor.systemBackground).opacity(0.01))
+              }
+          }
+
+          struct MiniPlayerView: View {
+              let track: Track
+              @StateObject var playerObj = PlayerManager.shared
+              
+              var body: some View {
+                  VStack(spacing: 0) {
+                      Divider().background(Color.gray.opacity(0.3))
+                      HStack(spacing: 15) {
+                          AsyncImage(url: URL(string: track.cover)) { img in
+                              img.resizable().aspectRatio(contentMode: .fill)
+                          } placeholder: { Color.gray }
+                          .frame(width: 44, height: 44)
+                          .cornerRadius(8)
+                          .shadow(radius: 3)
+                          
+                          VStack(alignment: .leading) {
+                              Text(track.title).font(.subheadline).bold().lineLimit(1)
+                              Text(track.artist).font(.caption).foregroundColor(.gray).lineLimit(1)
+                          }
+                          Spacer()
+                          
+                          Button(action: { playerObj.togglePlay() }) {
+                              Image(systemName: playerObj.isPlaying ? "pause.fill" : "play.fill")
+                                  .font(.title2)
+                                  .foregroundColor(.primary)
+                          }
+                          
+                          Button(action: { playerObj.nextTrack() }) {
+                              Image(systemName: "forward.fill")
+                                  .font(.title2)
+                                  .foregroundColor(.primary)
+                          }
+                      }
+                      .padding(.horizontal, 16)
+                      .padding(.vertical, 10)
+                      .background(Color(UIColor.secondarySystemBackground).ignoresSafeArea())
+                  }
+              }
+          }
+
+          struct FullPlayerView: View {
+              @StateObject var playerObj = PlayerManager.shared
+              @Environment(\.presentationMode) var presentationMode
+              
+              var body: some View {
+                  if let track = playerObj.currentTrack {
+                      VStack(spacing: 30) {
+                          Capsule()
+                              .fill(Color.gray.opacity(0.5))
+                              .frame(width: 40, height: 5)
+                              .padding(.top, 10)
+                              
+                          Spacer()
+                          
+                          AsyncImage(url: URL(string: track.cover)) { img in
+                              img.resizable().aspectRatio(contentMode: .fill)
+                          } placeholder: { Color.gray.opacity(0.2) }
+                          .frame(width: 300, height: 300)
+                          .cornerRadius(20)
+                          .shadow(color: .black.opacity(0.4), radius: 20, x: 0, y: 10)
+                          .scaleEffect(playerObj.isPlaying ? 1.0 : 0.9)
+                          .animation(.spring(), value: playerObj.isPlaying)
+                          
+                          HStack {
+                              VStack(alignment: .leading, spacing: 8) {
+                                  Text(track.title)
+                                      .font(.system(size: 24, weight: .bold))
+                                      .lineLimit(1)
+                                  Text(track.artist)
+                                      .font(.system(size: 18))
+                                      .foregroundColor(.gray)
+                                      .lineLimit(1)
+                              }
+                              Spacer()
+                              
+                              // === ПРАВИЛЬНОЕ СЕРДЕЧКО ===
+                              Button(action: { playerObj.toggleLike() }) {
+                                  Image(systemName: playerObj.isLiked ? "heart.fill" : "heart")
+                                      .font(.system(size: 28))
+                                      // Если добавлено - ярко-красное. Если нет - темно-серое полупрозрачное.
+                                      .foregroundColor(playerObj.isLiked ? .red : Color(UIColor.darkGray).opacity(0.6))
+                                      .scaleEffect(playerObj.isLiked ? 1.1 : 1.0)
+                                      .animation(.spring(response: 0.3, dampingFraction: 0.5), value: playerObj.isLiked)
+                              }
+                          }
+                          .padding(.horizontal, 30)
+                          
+                          Spacer()
+                          
+                          HStack(spacing: 40) {
+                              Button(action: { playerObj.prevTrack() }) {
+                                  Image(systemName: "backward.fill").font(.system(size: 32)).foregroundColor(.primary)
+                              }
+                              Button(action: { playerObj.togglePlay() }) {
+                                  Image(systemName: playerObj.isPlaying ? "pause.circle.fill" : "play.circle.fill")
+                                      .font(.system(size: 70))
+                                      .foregroundColor(.primary)
+                              }
+                              Button(action: { playerObj.nextTrack() }) {
+                                  Image(systemName: "forward.fill").font(.system(size: 32)).foregroundColor(.primary)
+                              }
+                          }
+                          Spacer()
+                      }
+                      .background(Color(UIColor.systemBackground).ignoresSafeArea())
+                  }
+              }
+          }
+          EOF
+          
+          # Сборка проекта через XcodeGen
+          cd App
+          xcodegen generate
+          
+      - name: Compile App
+        run: |
+          cd App
+          xcodebuild -project VKMusicNative.xcodeproj -scheme VKMusicNative -configuration Release -sdk iphoneos clean build CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" SYMROOT="$(PWD)/build"
+          
+      - name: Create IPA
+        run: |
+          cd App/build/Release-iphoneos
+          mkdir Payload
+          mv VKMusicNative.app Payload/
+          zip -r VKMusicNative.ipa Payload
+          
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: VKMusic-Native-App
+          path: App/build/Release-iphoneos/VKMusicNative.ipa
