@@ -10,6 +10,9 @@ jobs:
     runs-on: macos-14
     
     steps:
+      - name: Select Xcode 15.4
+        run: sudo xcode-select -s /Applications/Xcode_15.4.app/Contents/Developer
+        
       - name: Install XcodeGen
         run: brew install xcodegen
         
@@ -22,6 +25,7 @@ jobs:
           name: VKMusicNative
           options:
             bundleIdPrefix: com.stas
+            xcodeVersion: "15.4"
           targets:
             VKMusicNative:
               type: application
