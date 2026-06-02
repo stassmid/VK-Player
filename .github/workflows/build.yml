@@ -27,7 +27,6 @@ jobs:
 
       - name: Generate App Icon
         run: |
-          # Generate a nice gradients app icon programmatically
           mkdir -p App/Images.xcassets/AppIcon.appiconset
           cat > App/Images.xcassets/AppIcon.appiconset/Contents.json << 'EOF'
           {
@@ -46,7 +45,6 @@ jobs:
           }
           EOF
           
-          # Swift script to generate the icon
           cat > generate_icon.swift << 'EOF'
           import Foundation
           import CoreGraphics
@@ -58,7 +56,6 @@ jobs:
               let colorSpace = CGColorSpaceCreateDeviceRGB()
               guard let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: width * 4, space: colorSpace, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
               
-              // Gradient Background
               let colors = [CGColor(red: 0.1, green: 0.1, blue: 0.1, alpha: 1.0), CGColor(red: 0.2, green: 0.0, blue: 0.4, alpha: 1.0)] as CFArray
               if let gradient = CGGradient(colorsSpace: colorSpace, colors: colors, locations: [0.0, 1.0]) {
                   context.drawLinearGradient(gradient, start: CGPoint(x: 0, y: 0), end: CGPoint(x: size, y: size), options: [])
@@ -115,8 +112,7 @@ jobs:
                   CFBundleShortVersionString: "2.0"
                   CFBundleVersion: "1"
                   UILaunchStoryboardName: LaunchScreen
-                  UIBackgroundModes:
-                    - audio
+                  UIBackgroundModes: [audio]
                   NSAppTransportSecurity:
                     NSAllowsArbitraryLoads: true
                   UISupportedInterfaceOrientations:
@@ -345,8 +341,6 @@ jobs:
                   return musicDir.appendingPathComponent("\(track.uniqueKey).mp3")
               }
 
-              // MARK: - Track Metadata Storage
-
               func saveTrackMeta(_ track: Track) {
                   var list = loadTracksMeta()
                   if !list.contains(where: { $0.uniqueKey == track.uniqueKey }) {
@@ -365,14 +359,10 @@ jobs:
                   return tracks
               }
 
-              // MARK: - My Music Order
-
               func saveMyMusicOrder(_ tracks: [Track]) {
                   if let encoded = try? JSONEncoder().encode(tracks) {
                       UserDefaults.standard.set(encoded, forKey: "myMusicOrder")
                   }
-                  
-                  // Update the set of liked IDs
                   myMusicIDs = Set(tracks.map { $0.uniqueKey })
                   persistMyMusicIDs()
               }
@@ -395,7 +385,6 @@ jobs:
                   return tracks
               }
 
-              /// Returns cached tracks in the same order as My Music
               func getCachedTracksInOrder() -> [Track] {
                   let order = getMyMusicOrder()
                   if !order.isEmpty {
@@ -403,8 +392,6 @@ jobs:
                   }
                   return loadTracksMeta().filter { isDownloaded($0) }
               }
-
-              // MARK: - Download
 
               func download(track: Track) async -> Bool {
                   guard !isDownloaded(track) else { return true }
@@ -428,7 +415,6 @@ jobs:
                   }
               }
 
-              /// Sync: download tracks that aren't cached yet
               func syncNewTracks(from tracks: [Track]) async -> Int {
                   let toDownload = tracks.filter { !isDownloaded($0) }
                   guard !toDownload.isEmpty else { return 0 }
@@ -450,7 +436,6 @@ jobs:
                   return downloaded
               }
 
-              /// Download ALL my music (paginated)
               func downloadAllMyMusic() async -> Int {
                   await MainActor.run {
                       isDownloading = true
@@ -465,9 +450,13 @@ jobs:
                   while true {
                       guard let batch = try? await APIService.shared.fetchMyMusic(offset: offset, count: batchSize) else { break }
                       if batch.isEmpty { break }
-                      allTracks.append(contentsOf: batch)
-                      offset += batch.count
-                      if batch.count < batchSize { break }
+                      
+                      // Filter out duplicates safely
+                      let newTracks = batch.filter { t in !allTracks.contains(where: { $0.uniqueKey == t.uniqueKey }) }
+                      allTracks.append(contentsOf: newTracks)
+                      
+                      // ALWAYS increment by requested batch size (200), not the received count, to fix VK API block skips
+                      offset += batchSize
                   }
 
                   await MainActor.run {
@@ -485,8 +474,6 @@ jobs:
                   await MainActor.run { isDownloading = false }
                   return downloaded
               }
-
-              // MARK: - Delete
 
               func deleteCache(for track: Track) {
                   try? fm.removeItem(at: localURL(for: track))
@@ -548,10 +535,7 @@ jobs:
                   registerRemoteCommands()
               }
 
-              // MARK: - Public Playback API
-
               func play(track: Track, in tracks: [Track], isVKMix: Bool = false) {
-                  // If user taps on the currently playing track, just toggle play/pause!
                   if track == currentTrack && queue == tracks {
                       togglePlay()
                       return
@@ -587,6 +571,7 @@ jobs:
                   if isPlaying {
                       p.pause()
                   } else {
+                      try? AVAudioSession.sharedInstance().setActive(true)
                       p.play()
                   }
                   isPlaying.toggle()
@@ -597,6 +582,7 @@ jobs:
                   guard !queue.isEmpty else { return }
                   if playMode == .repeatOne {
                       avPlayer?.seek(to: .zero)
+                      try? AVAudioSession.sharedInstance().setActive(true)
                       avPlayer?.play()
                       isPlaying = true
                       return
@@ -608,8 +594,6 @@ jobs:
 
               func prevTrack() {
                   guard !queue.isEmpty else { return }
-                  // Removed 3-second seek behavior per user request
-                  // Now it ALWAYS goes to the previous track
                   removeObservers()
                   currentIndex = currentIndex > 0 ? currentIndex - 1 : queue.count - 1
                   beginPlayback()
@@ -642,8 +626,6 @@ jobs:
                   }
               }
 
-              // MARK: - Private Playback
-
               private func beginPlayback() {
                   guard currentIndex >= 0, currentIndex < queue.count else { return }
                   let track = queue[currentIndex]
@@ -651,9 +633,7 @@ jobs:
                   currentTime = 0
                   duration = 0
 
-                  // Determine URL: cached file or remote
-                  let docsDir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-                      .appendingPathComponent("CachedMusic")
+                  let docsDir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("CachedMusic")
                   let localFile = docsDir.appendingPathComponent("\(track.uniqueKey).mp3")
 
                   let playURL: URL
@@ -664,12 +644,18 @@ jobs:
                       playURL = remote
                   }
 
+                  do {
+                      try AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: [.allowBluetooth, .allowAirPlay])
+                      try AVAudioSession.sharedInstance().setActive(true)
+                  } catch {
+                      print("Audio session error: \(error)")
+                  }
+
                   let playerItem = AVPlayerItem(url: playURL)
                   avPlayer = AVPlayer(playerItem: playerItem)
                   avPlayer?.play()
                   isPlaying = true
 
-                  // Periodic time observer
                   timeObserverToken = avPlayer?.addPeriodicTimeObserver(
                       forInterval: CMTime(seconds: 0.5, preferredTimescale: 600),
                       queue: .main
@@ -683,7 +669,6 @@ jobs:
                       self.syncNowPlayingTime()
                   }
 
-                  // End of track observer
                   endObserver = NotificationCenter.default.addObserver(
                       forName: .AVPlayerItemDidPlayToEndTime,
                       object: playerItem,
@@ -699,6 +684,7 @@ jobs:
               private func handleTrackEnd() {
                   if playMode == .repeatOne {
                       avPlayer?.seek(to: .zero)
+                      try? AVAudioSession.sharedInstance().setActive(true)
                       avPlayer?.play()
                   } else {
                       removeObservers()
@@ -718,9 +704,6 @@ jobs:
                   }
               }
 
-              // MARK: - Remote Commands (Lock Screen / Control Center)
-              // Registered ONCE to avoid duplicate handler bug
-
               private func registerRemoteCommands() {
                   guard !commandsRegistered else { return }
                   commandsRegistered = true
@@ -729,6 +712,7 @@ jobs:
 
                   center.playCommand.isEnabled = true
                   center.playCommand.addTarget { [weak self] _ in
+                      try? AVAudioSession.sharedInstance().setActive(true)
                       self?.avPlayer?.play()
                       DispatchQueue.main.async { self?.isPlaying = true }
                       return .success
@@ -770,8 +754,6 @@ jobs:
                   }
               }
 
-              // MARK: - Now Playing Info
-
               private func updateNowPlayingInfo() {
                   guard let track = currentTrack else { return }
                   var info: [String: Any] = [
@@ -785,7 +767,6 @@ jobs:
                   }
                   MPNowPlayingInfoCenter.default().nowPlayingInfo = info
 
-                  // Load cover artwork
                   if let coverURL = URL(string: track.cover) {
                       URLSession.shared.dataTask(with: coverURL) { data, _, _ in
                           guard let imgData = data, let image = UIImage(data: imgData) else { return }
@@ -807,8 +788,6 @@ jobs:
                   MPNowPlayingInfoCenter.default().nowPlayingInfo = info
               }
 
-              // MARK: - Recently Played
-
               func addToRecentlyPlayed(_ track: Track) {
                   recentlyPlayed.removeAll { $0.uniqueKey == track.uniqueKey }
                   recentlyPlayed.insert(track, at: 0)
@@ -825,8 +804,6 @@ jobs:
                         let tracks = try? JSONDecoder().decode([Track].self, from: data) else { return }
                   recentlyPlayed = tracks
               }
-
-              // MARK: - Search History
 
               func addSearchQuery(_ query: String) {
                   let q = query.trimmingCharacters(in: .whitespaces)
@@ -866,43 +843,29 @@ jobs:
               var body: some View {
                   ZStack(alignment: .bottom) {
                       VStack(spacing: 0) {
-                          // Top tab bar
                           tabBar
-
-                          // Tab content
                           ZStack {
                               switch selectedTab {
-                              case 0:
-                                  MyMusicView()
-                              case 1:
-                                  VKMixView() // Replaced Online with VK Mix
-                              case 2:
-                                  SearchView()
-                              case 3:
-                                  PlaylistsView()
-                              default:
-                                  EmptyView()
+                              case 0: MyMusicView()
+                              case 1: VKMixView() 
+                              case 2: SearchView()
+                              case 3: PlaylistsView()
+                              default: EmptyView()
                               }
                           }
                           .frame(maxWidth: .infinity, maxHeight: .infinity)
 
-                          // Spacer for mini player
                           if player.currentTrack != nil {
                               Color.clear.frame(height: 70)
                           }
                       }
 
-                      // Mini player overlay
                       if player.currentTrack != nil {
-                          MiniPlayerView(onTap: {
-                              showFullPlayer = true
-                          })
+                          MiniPlayerView(onTap: { showFullPlayer = true })
                           .gesture(
                               DragGesture(minimumDistance: 20)
                                   .onEnded { value in
-                                      if value.translation.height < -50 {
-                                          showFullPlayer = true
-                                      }
+                                      if value.translation.height < -50 { showFullPlayer = true }
                                   }
                           )
                       }
@@ -1004,7 +967,8 @@ jobs:
               private var allTracksSection: some View {
                   ScrollView {
                       LazyVStack(spacing: 0) {
-                          ForEach(Array(tracks.enumerated()), id: \.offset) { index, track in
+                          // USE UNIQUE KEY FOR SMOOTH SCROLLING
+                          ForEach(Array(tracks.enumerated()), id: \.element.uniqueKey) { index, track in
                               TrackRow(
                                   track: track,
                                   isPlaying: player.currentTrack == track && player.isPlaying,
@@ -1018,7 +982,8 @@ jobs:
                                   trackContextMenu(for: track)
                               }
                               .onAppear {
-                                  if index >= tracks.count - 5 {
+                                  // TRIGGER EARLIER (10 ITEMS BEFORE END)
+                                  if index >= tracks.count - 10 {
                                       Task { await loadMoreTracks() }
                                   }
                               }
@@ -1097,7 +1062,7 @@ jobs:
                       } else {
                           ScrollView {
                               LazyVStack(spacing: 0) {
-                                  ForEach(Array(cachedList.enumerated()), id: \.offset) { _, track in
+                                  ForEach(Array(cachedList.enumerated()), id: \.element.uniqueKey) { _, track in
                                       TrackRow(
                                           track: track,
                                           isPlaying: player.currentTrack == track && player.isPlaying,
@@ -1123,8 +1088,6 @@ jobs:
                       }
                   }
               }
-
-              // MARK: - Context Menu
 
               @ViewBuilder
               private func trackContextMenu(for track: Track) -> some View {
@@ -1174,7 +1137,7 @@ jobs:
                   }
               }
 
-              // MARK: - Data Loading
+              // MARK: - FIXED PAGINATION (Load Loading)
 
               private func loadInitialTracks() async {
                   guard tracks.isEmpty else { return }
@@ -1182,8 +1145,10 @@ jobs:
                   do {
                       let result = try await APIService.shared.fetchMyMusic(offset: 0, count: 200)
                       tracks = result
-                      loadOffset = result.count
-                      hasMore = result.count >= 200
+                      // ALWAYS INCREMENT BY 200, REGARDLESS OF RECEIVED COUNT!
+                      loadOffset = 200
+                      // CONTINUE IF ARRAY IS NOT COMPLETELY EMPTY
+                      hasMore = !result.isEmpty
                       cache.saveMyMusicOrder(result)
                   } catch {
                       print("Load error: \(error)")
@@ -1196,9 +1161,12 @@ jobs:
                   isLoading = true
                   do {
                       let result = try await APIService.shared.fetchMyMusic(offset: loadOffset, count: 200)
-                      tracks.append(contentsOf: result)
-                      loadOffset += result.count
-                      hasMore = result.count >= 200
+                      // Filter duplicates just in case
+                      let newTracks = result.filter { newTrack in !tracks.contains(where: { $0.uniqueKey == newTrack.uniqueKey }) }
+                      tracks.append(contentsOf: newTracks)
+                      
+                      loadOffset += 200
+                      hasMore = !result.isEmpty
                       cache.saveMyMusicOrder(tracks)
                   } catch {
                       print("Load more error: \(error)")
@@ -1217,8 +1185,6 @@ jobs:
                   guard let first = cached.first else { return }
                   player.play(track: first, in: cached)
               }
-
-              // MARK: - Toast
 
               private func showToast(_ msg: String) {
                   withAnimation { toastMessage = msg }
@@ -1246,7 +1212,7 @@ jobs:
           XEOF
 
           # ============================================================
-          # 8. VK MIX VIEW (Replaces Online)
+          # 8. VK MIX VIEW
           # ============================================================
           cat > App/Sources/VKMixView.swift << 'XEOF'
           import SwiftUI
@@ -1272,7 +1238,6 @@ jobs:
                               .shadow(color: .purple.opacity(0.5), radius: 30, x: 0, y: 10)
                               
                           if player.isVKMixPlaying && player.isPlaying {
-                              // Cool animation if playing VK Mix
                               Circle()
                                   .stroke(Color.white.opacity(0.4), lineWidth: 4)
                                   .frame(width: 230, height: 230)
@@ -1363,7 +1328,6 @@ jobs:
 
               var body: some View {
                   VStack(spacing: 0) {
-                      // Search bar
                       HStack(spacing: 8) {
                           Image(systemName: "magnifyingglass")
                               .foregroundColor(.gray)
@@ -1389,21 +1353,15 @@ jobs:
                       .padding(.horizontal, 16)
                       .padding(.vertical, 10)
 
-                      // Content
                       ScrollView {
                           switch currentMode {
-                          case .idle:
-                              idleContent
-                          case .results:
-                              searchResultsContent
-                          case .recentlyPlayed:
-                              recentlyPlayedContent
+                          case .idle: idleContent
+                          case .results: searchResultsContent
+                          case .recentlyPlayed: recentlyPlayedContent
                           }
                       }
                   }
               }
-
-              // MARK: - Idle
 
               private var idleContent: some View {
                   VStack(alignment: .leading, spacing: 16) {
@@ -1440,7 +1398,6 @@ jobs:
                       }
 
                       VStack(spacing: 10) {
-                          // Recently played
                           Button { currentMode = .recentlyPlayed } label: {
                               HStack(spacing: 14) {
                                   ZStack {
@@ -1474,8 +1431,6 @@ jobs:
                   .padding(.top, 6)
               }
 
-              // MARK: - Search Results
-
               private var searchResultsContent: some View {
                   VStack(spacing: 0) {
                       if isSearching {
@@ -1491,7 +1446,7 @@ jobs:
                           .padding(.top, 60)
                       } else {
                           LazyVStack(spacing: 0) {
-                              ForEach(Array(searchResults.enumerated()), id: \.offset) { _, track in
+                              ForEach(Array(searchResults.enumerated()), id: \.element.uniqueKey) { _, track in
                                   TrackRow(
                                       track: track,
                                       isPlaying: player.currentTrack == track && player.isPlaying,
@@ -1509,8 +1464,6 @@ jobs:
                   }
               }
 
-              // MARK: - Recently Played
-
               private var recentlyPlayedContent: some View {
                   VStack(alignment: .leading, spacing: 0) {
                       headerBar(title: "Последние прослушанные")
@@ -1519,7 +1472,7 @@ jobs:
                           emptyState(icon: "clock", text: "Тут пока пусто")
                       } else {
                           LazyVStack(spacing: 0) {
-                              ForEach(Array(player.recentlyPlayed.enumerated()), id: \.offset) { _, track in
+                              ForEach(Array(player.recentlyPlayed.enumerated()), id: \.element.uniqueKey) { _, track in
                                   TrackRow(
                                       track: track,
                                       isPlaying: player.currentTrack == track && player.isPlaying,
@@ -1536,8 +1489,6 @@ jobs:
                       }
                   }
               }
-
-              // MARK: - Helpers
 
               private func headerBar(title: String) -> some View {
                   HStack {
@@ -1616,8 +1567,6 @@ jobs:
                   .task { await loadPlaylists() }
               }
 
-              // MARK: - Grid
-
               private var playlistGridView: some View {
                   ScrollView {
                       VStack(alignment: .leading, spacing: 12) {
@@ -1653,8 +1602,6 @@ jobs:
                   }
               }
 
-              // MARK: - Tracks
-
               private var playlistTracksView: some View {
                   VStack(alignment: .leading, spacing: 0) {
                       HStack {
@@ -1683,7 +1630,7 @@ jobs:
                       } else {
                           ScrollView {
                               LazyVStack(spacing: 0) {
-                                  ForEach(Array(playlistTracks.enumerated()), id: \.offset) { _, track in
+                                  ForEach(Array(playlistTracks.enumerated()), id: \.element.uniqueKey) { _, track in
                                       TrackRow(
                                           track: track,
                                           isPlaying: player.currentTrack == track && player.isPlaying,
@@ -1701,8 +1648,6 @@ jobs:
                       }
                   }
               }
-
-              // MARK: - Actions
 
               private func loadPlaylists() async {
                   guard playlists.isEmpty else { return }
